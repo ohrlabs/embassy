@@ -72,6 +72,11 @@ impl<'d> Input<'d> {
     pub fn get_level(&self) -> Level {
         self.pin.get_level()
     }
+    
+    /// Set the pin's sense polarity.
+    pub fn set_sense(&mut self, sense: Sense) {
+        self.pin.set_sense(sense)
+    }
 }
 
 /// Digital input or output level.
@@ -197,6 +202,11 @@ impl<'d> Output<'d> {
     #[inline]
     pub fn get_output_level(&self) -> Level {
         self.pin.get_output_level()
+    }
+
+    /// Set the pin's sense polarity.
+    pub fn set_sense(&mut self, sense: Sense) {
+        self.pin.set_sense(sense)
     }
 }
 
