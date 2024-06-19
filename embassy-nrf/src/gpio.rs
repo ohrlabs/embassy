@@ -14,7 +14,7 @@ use crate::pac::gpio::pin_cnf::{DRIVE_A, PULL_A};
 #[cfg(not(feature = "nrf51"))]
 use crate::pac::p0 as gpio;
 #[cfg(not(feature = "nrf51"))]
-use crate::pac::p0::pin_cnf::{DRIVE_A, PULL_A};
+use crate::pac::p0::pin_cnf::{DRIVE_A, PULL_A, SENSE_A};
 use crate::{pac, Peripheral};
 
 /// A GPIO port with up to 32 pins.
@@ -100,6 +100,18 @@ impl From<Level> for bool {
             Level::High => true,
         }
     }
+}
+
+/// Pin's level sensing, used to wake the device from low power states.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Sense {
+    /// Sense is disabled for the pin.
+    Disabled = 0,
+    /// Pin detects a logical high
+    High = 2,
+    /// Pin detects a logical low
+    Low = 3,
 }
 
 /// Drive strength settings for an output pin.
@@ -209,6 +221,14 @@ fn convert_pull(pull: Pull) -> PULL_A {
     }
 }
 
+pub(crate) fn convert_sense(sense: Sense) -> SENSE_A {
+    match sense {
+        Sense::Disabled => SENSE_A::DISABLED,
+        Sense::High => SENSE_A::HIGH,
+        Sense::Low => SENSE_A::LOW,
+    }
+}
+
 /// GPIO flexible pin.
 ///
 /// This pin can either be a disconnected, input, or output pin, or both. The level register bit will remain
@@ -216,6 +236,7 @@ fn convert_pull(pull: Pull) -> PULL_A {
 /// mode.
 pub struct Flex<'d> {
     pub(crate) pin: PeripheralRef<'d, AnyPin>,
+    pub(crate) sense: Sense,
 }
 
 impl<'d> Flex<'d> {
@@ -227,7 +248,10 @@ impl<'d> Flex<'d> {
     pub fn new(pin: impl Peripheral<P = impl Pin> + 'd) -> Self {
         into_ref!(pin);
         // Pin will be in disconnected state.
-        Self { pin: pin.map_into() }
+        Self {
+            pin: pin.map_into(),
+            sense: Sense::Disabled,
+        }
     }
 
     /// Put the pin into input mode.
@@ -238,7 +262,7 @@ impl<'d> Flex<'d> {
             w.input().connect();
             w.pull().variant(convert_pull(pull));
             w.drive().s0s1();
-            w.sense().disabled();
+            w.sense().variant(convert_sense(self.sense));
             w
         });
     }
@@ -254,7 +278,7 @@ impl<'d> Flex<'d> {
             w.input().disconnect();
             w.pull().disabled();
             w.drive().variant(convert_drive(drive));
-            w.sense().disabled();
+            w.sense().variant(convert_sense(self.sense));
             w
         });
     }
@@ -275,7 +299,7 @@ impl<'d> Flex<'d> {
             w.input().connect();
             w.pull().variant(convert_pull(pull));
             w.drive().variant(convert_drive(drive));
-            w.sense().disabled();
+            w.sense().variant(convert_sense(self.sense));
             w
         });
     }
@@ -283,6 +307,7 @@ impl<'d> Flex<'d> {
     /// Put the pin into disconnected mode.
     #[inline]
     pub fn set_as_disconnected(&mut self) {
+        self.sense = Sense::Disabled;
         self.pin.conf().reset();
     }
 
@@ -351,6 +376,12 @@ impl<'d> Flex<'d> {
     #[inline]
     pub fn get_output_level(&self) -> Level {
         self.is_set_high().into()
+    }
+
+    /// Set the pin's sense polarity.
+    pub fn set_sense(&mut self, sense: Sense) {
+        self.sense = sense;
+        self.pin.conf().modify(|_, w| w.sense().variant(convert_sense(sense)));
     }
 }
 
