@@ -39,6 +39,7 @@ pub(crate) struct State {
     rx_started_count: AtomicU8,
     rx_ended_count: AtomicU8,
     rx_ppi_ch: AtomicU8,
+    rx_overrun: AtomicBool,
 }
 
 /// UART error.
@@ -46,7 +47,8 @@ pub(crate) struct State {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
-    // No errors for now
+    /// Buffer Overrun
+    Overrun,
 }
 
 impl State {
@@ -60,6 +62,7 @@ impl State {
             rx_started_count: AtomicU8::new(0),
             rx_ended_count: AtomicU8::new(0),
             rx_ppi_ch: AtomicU8::new(0),
+            rx_overrun: AtomicBool::new(false),
         }
     }
 }
@@ -86,7 +89,8 @@ impl<U: UarteInstance> interrupt::typelevel::Handler<U::Interrupt> for Interrupt
                 r.errorsrc().write_value(errs);
 
                 if errs.overrun() {
-                    panic!("BufferedUarte overrun");
+                    s.rx_overrun.store(true, Ordering::Release);
+                    ss.rx_waker.wake();
                 }
             }
 
@@ -660,6 +664,7 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
         s.rx_started_count.store(0, Ordering::Relaxed);
         s.rx_ended_count.store(0, Ordering::Relaxed);
         s.rx_started.store(false, Ordering::Relaxed);
+        s.rx_overrun.store(false, Ordering::Relaxed);
         let rx_len = rx_buffer.len().min(EASY_DMA_SIZE * 2);
         unsafe { s.rx_buf.init(rx_buffer.as_mut_ptr(), rx_len) };
 
@@ -728,6 +733,10 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
             let s = U::buffered_state();
             let ss = U::state();
 
+            if s.rx_overrun.swap(false, Ordering::Acquire) {
+                return Poll::Ready(Err(Error::Overrun));
+            }
+
             // Read the RXDRDY counter.
             T::regs().tasks_capture(0).write_value(1);
             let mut end = T::regs().cc(0).read() as usize;
@@ -786,6 +795,9 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
     /// we are ready to read if there is data in the buffer
     fn read_ready() -> Result<bool, Error> {
         let state = U::buffered_state();
+        if state.rx_overrun.swap(false, Ordering::Acquire) {
+            return Err(Error::Overrun);
+        }
         Ok(!state.rx_buf.is_empty())
     }
 }
@@ -820,7 +832,9 @@ mod _embedded_io {
 
     impl embedded_io_async::Error for Error {
         fn kind(&self) -> embedded_io_async::ErrorKind {
-            match *self {}
+            match *self {
+                Error::Overrun => embedded_io_async::ErrorKind::OutOfMemory,
+            }
         }
     }
 
