@@ -40,6 +40,7 @@ pub(crate) struct State {
     rx_ended_count: AtomicU8,
     rx_ppi_ch: AtomicU8,
     rx_overrun: AtomicBool,
+    rx_chunk_len: AtomicUsize,
 }
 
 /// UART error.
@@ -63,6 +64,7 @@ impl State {
             rx_ended_count: AtomicU8::new(0),
             rx_ppi_ch: AtomicU8::new(0),
             rx_overrun: AtomicBool::new(false),
+            rx_chunk_len: AtomicUsize::new(0),
         }
     }
 }
@@ -80,8 +82,7 @@ impl<U: UarteInstance> interrupt::typelevel::Handler<U::Interrupt> for Interrupt
         let s = U::buffered_state();
 
         if let Some(mut rx) = unsafe { s.rx_buf.try_writer() } {
-            let buf_len = s.rx_buf.len();
-            let half_len = buf_len / 2;
+            let chunk_len = s.rx_chunk_len.load(Ordering::Relaxed);
 
             if r.events_error().read() != 0 {
                 r.events_error().write_value(0);
@@ -112,14 +113,14 @@ impl<U: UarteInstance> interrupt::typelevel::Handler<U::Interrupt> for Interrupt
             if r.events_rxstarted().read() != 0 || !s.rx_started.load(Ordering::Relaxed) {
                 //trace!("  irq_rx: rxstarted");
                 let (ptr, len) = rx.push_buf();
-                if len >= half_len {
+                if len >= chunk_len {
                     r.events_rxstarted().write_value(0);
 
-                    //trace!("  irq_rx: starting second {:?}", half_len);
+                    //trace!("  irq_rx: starting next {:?}", chunk_len);
 
                     // Set up the DMA read
                     r.rxd().ptr().write_value(ptr as u32);
-                    r.rxd().maxcnt().write(|w| w.set_maxcnt(half_len as _));
+                    r.rxd().maxcnt().write(|w| w.set_maxcnt(chunk_len as _));
 
                     let chn = s.rx_ppi_ch.load(Ordering::Relaxed);
 
@@ -163,7 +164,7 @@ impl<U: UarteInstance> interrupt::typelevel::Handler<U::Interrupt> for Interrupt
                         r.tasks_startrx().write_value(1);
                     }
 
-                    rx.push_done(half_len);
+                    rx.push_done(chunk_len);
 
                     s.rx_started_count.store(rx_started.wrapping_add(1), Ordering::Relaxed);
                     s.rx_started.store(true, Ordering::Relaxed);
@@ -223,7 +224,11 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarte<'d, U, T> {
     ///
     /// # Panics
     ///
-    /// Panics if `rx_buffer.len()` is odd.
+    /// Panics if `rx_buffer.len()` is less than 2.
+    ///
+    /// The RX buffer is used as a ring of equal chunks, each received by one DMA transfer.  The
+    /// chunk length is half the buffer, capped at the EasyDMA limit, and any bytes beyond a whole
+    /// number of chunks are left unused.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         uarte: impl Peripheral<P = U> + 'd,
@@ -259,7 +264,11 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarte<'d, U, T> {
     ///
     /// # Panics
     ///
-    /// Panics if `rx_buffer.len()` is odd.
+    /// Panics if `rx_buffer.len()` is less than 2.
+    ///
+    /// The RX buffer is used as a ring of equal chunks, each received by one DMA transfer.  The
+    /// chunk length is half the buffer, capped at the EasyDMA limit, and any bytes beyond a whole
+    /// number of chunks are left unused.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_rtscts(
         uarte: impl Peripheral<P = U> + 'd,
@@ -558,7 +567,11 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
     ///
     /// # Panics
     ///
-    /// Panics if `rx_buffer.len()` is odd.
+    /// Panics if `rx_buffer.len()` is less than 2.
+    ///
+    /// The RX buffer is used as a ring of equal chunks, each received by one DMA transfer.  The
+    /// chunk length is half the buffer, capped at the EasyDMA limit, and any bytes beyond a whole
+    /// number of chunks are left unused.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         uarte: impl Peripheral<P = U> + 'd,
@@ -589,7 +602,11 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
     ///
     /// # Panics
     ///
-    /// Panics if `rx_buffer.len()` is odd.
+    /// Panics if `rx_buffer.len()` is less than 2.
+    ///
+    /// The RX buffer is used as a ring of equal chunks, each received by one DMA transfer.  The
+    /// chunk length is half the buffer, capped at the EasyDMA limit, and any bytes beyond a whole
+    /// number of chunks are left unused.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_rts(
         uarte: impl Peripheral<P = U> + 'd,
@@ -653,7 +670,7 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
         rts: Option<PeripheralRef<'d, AnyPin>>,
         rx_buffer: &'d mut [u8],
     ) -> Self {
-        assert!(rx_buffer.len() % 2 == 0);
+        assert!(rx_buffer.len() >= 2);
 
         let r = U::regs();
 
@@ -665,7 +682,13 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
         s.rx_ended_count.store(0, Ordering::Relaxed);
         s.rx_started.store(false, Ordering::Relaxed);
         s.rx_overrun.store(false, Ordering::Relaxed);
-        let rx_len = rx_buffer.len().min(EASY_DMA_SIZE * 2);
+        // The DMA receives into a ring of equal chunks: one being received, one queued in the
+        // double-buffered PTR/MAXCNT registers and the rest holding data for the reader.  The ring
+        // must be a whole number of chunks so that every chunk is contiguous, or the IRQ would
+        // never find room for one at the end of the ring and reception would stop.
+        let chunk_len = (rx_buffer.len() / 2).min(EASY_DMA_SIZE);
+        let rx_len = rx_buffer.len() - rx_buffer.len() % chunk_len;
+        s.rx_chunk_len.store(chunk_len, Ordering::Relaxed);
         unsafe { s.rx_buf.init(rx_buffer.as_mut_ptr(), rx_len) };
 
         // clear errors
