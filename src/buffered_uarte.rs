@@ -12,7 +12,7 @@ use core::cmp::min;
 use core::future::{poll_fn, Future};
 use core::marker::PhantomData;
 use core::slice;
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use embassy_hal_internal::atomic_ring_buffer::RingBuffer;
@@ -36,11 +36,11 @@ pub(crate) struct State {
 
     rx_buf: RingBuffer,
     rx_started: AtomicBool,
-    rx_started_count: AtomicU8,
-    rx_ended_count: AtomicU8,
     rx_ppi_ch: AtomicU8,
     rx_overrun: AtomicBool,
     rx_chunk_len: AtomicUsize,
+    /// The TIMER counting RXDRDY events.
+    rx_timer: AtomicPtr<()>,
 }
 
 /// UART error.
@@ -60,12 +60,163 @@ impl State {
 
             rx_buf: RingBuffer::new(),
             rx_started: AtomicBool::new(false),
-            rx_started_count: AtomicU8::new(0),
-            rx_ended_count: AtomicU8::new(0),
             rx_ppi_ch: AtomicU8::new(0),
             rx_overrun: AtomicBool::new(false),
             rx_chunk_len: AtomicUsize::new(0),
+            rx_timer: AtomicPtr::new(core::ptr::null_mut()),
         }
+    }
+}
+
+/// How the RX buffer is divided into DMA chunks.
+///
+/// The DMA receives into a ring of equal chunks: one being received, one queued in the
+/// double-buffered PTR/MAXCNT registers and the rest holding data for the reader.  The ring must
+/// be a whole number of chunks so that every chunk is contiguous, or the IRQ would never find room
+/// for one at the end of the ring and reception would stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RxLayout {
+    /// The length of each DMA transfer.
+    chunk_len: usize,
+    /// The part of the buffer used as the ring, a whole number of chunks.
+    ring_len: usize,
+}
+
+impl RxLayout {
+    /// Lays out a buffer of `buf_len` bytes, at least 2, for a DMA that moves at most `dma_max`
+    /// bytes per transfer.  The chunk length is half the buffer, capped at `dma_max`.
+    const fn new(buf_len: usize, dma_max: usize) -> Self {
+        let half = buf_len / 2;
+        let chunk_len = if half < dma_max { half } else { dma_max };
+        Self {
+            chunk_len,
+            ring_len: buf_len - buf_len % chunk_len,
+        }
+    }
+}
+
+/// Finds the received bytes the reader can take next, as `(offset, n)` into the ring: the bytes
+/// from the reader's position up to `end` or the end of the ring, whichever comes first.  Returns
+/// `None` if there are none.
+///
+/// `start` is the ring buffer's read index and `end` the index up to which received bytes are in
+/// RAM ([`RxDmaPos::rx_end`]), both of which wrap at `2 * len` so that a full ring can be told from
+/// an empty one.  This mirrors `atomic_ring_buffer::Reader::pop_buf()`, with `end` in place of the
+/// ring's own write index, which runs ahead to the end of the last chunk set up for DMA.
+fn rx_readable(mut start: usize, mut end: usize, len: usize) -> Option<(usize, usize)> {
+    if start == end {
+        return None;
+    }
+
+    if start >= len {
+        start -= len
+    }
+    if end >= len {
+        end -= len
+    }
+
+    let n = if end > start { end - start } else { len - start };
+    assert!(n != 0);
+    Some((start, n))
+}
+
+/// Read the RXDRDY count, in the ring's `0..2*len` index space.
+fn rxdrdy_counter(timer: pac::timer::Timer) -> usize {
+    // The interrupt also captures into CC[0]; if it does so between the reader's capture and read,
+    // the reader gets the newer count, which is just as valid.
+    timer.tasks_capture(0).write_value(1);
+    timer.cc(0).read() as usize
+}
+
+/// Where the RX DMA is, read from the hardware.
+///
+/// RX transfers are one chunk each, back to back.  At most one is queued (set up, with the ENDRX ->
+/// STARTRX PPI channel armed) while another one runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RxDmaPos {
+    /// Received bytes, from the RXDRDY counter, in the ring's `0..2*len` index space.
+    ///
+    /// RXDRDY fires when a byte reaches the head of the UARTE's RX FIFO.  While a transfer runs,
+    /// that is as the DMA writes it to RAM; while the DMA is stopped, received bytes wait in the
+    /// FIFO, and the one at its head is already counted.
+    counter: usize,
+    /// End of the transfers the DMA has started, in the same index space.  The DMA writes nothing
+    /// past it.
+    dma_end: usize,
+    /// Whether a transfer is queued and hasn't started yet.
+    queued: bool,
+}
+
+impl RxDmaPos {
+    /// Read the position.  The interrupt changes the ring's write index and the PPI channel, so the
+    /// reader must call this with the interrupt masked to get a consistent result.
+    fn read(s: &State) -> Self {
+        let timer = unsafe { pac::timer::Timer::from_ptr(s.rx_timer.load(Ordering::Relaxed)) };
+
+        // Read the counter before the PPI channel: if the channel is still armed when read, the
+        // queued transfer hadn't started when the counter was read either.
+        let counter = rxdrdy_counter(timer);
+        let chn = s.rx_ppi_ch.load(Ordering::Relaxed);
+        let queued = ppi::regs().chen().read().ch(chn as _);
+
+        Self::new(
+            counter,
+            s.rx_buf.end.load(Ordering::Relaxed),
+            queued,
+            s.rx_chunk_len.load(Ordering::Relaxed),
+            s.rx_buf.len(),
+        )
+    }
+
+    /// The position given the RXDRDY count, the ring's write index (the end of all transfers set
+    /// up so far), whether a transfer is queued, and the chunk and ring lengths.
+    fn new(mut counter: usize, ring_end: usize, queued: bool, chunk_len: usize, len: usize) -> Self {
+        // We've set a compare channel that resets the counter to 0 when it reaches `len*2`.
+        // However, it's unclear if that's instant, or there's a small window where you can
+        // still read `len()*2`.
+        // This could happen if in one clock cycle the counter is updated, and in the next the
+        // clear takes effect. The docs are very sparse, they just say "Task delays: After TIMER
+        // is started, the CLEAR, COUNT, and STOP tasks are guaranteed to take effect within one
+        // clock cycle of the PCLK16M." :shrug:
+        // So, we wrap the counter ourselves, just in case.
+        if counter >= len * 2 {
+            counter = 0;
+        }
+
+        // A queued transfer hasn't started.
+        let dma_end = if queued {
+            (ring_end + 2 * len - chunk_len) % (2 * len)
+        } else {
+            ring_end
+        };
+
+        Self {
+            counter,
+            dma_end,
+            queued,
+        }
+    }
+
+    /// How many bytes past `dma_end` the counter is, or `None` if the running transfer still has
+    /// bytes to receive.
+    fn counter_past_dma_end(&self, len: usize) -> Option<usize> {
+        // The counter is never more than a chunk, at most half the ring, behind `dma_end` (the
+        // running transfer), and never more than a byte past it (the byte at the head of the
+        // FIFO).
+        let past = (self.counter + 2 * len - self.dma_end) % (2 * len);
+        if past < len {
+            Some(past)
+        } else {
+            None
+        }
+    }
+
+    /// The ring index up to which received bytes are in RAM, for a reader at `start`.
+    fn rx_end(&self, start: usize, len: usize) -> usize {
+        // Bytes counted past the end of the started transfers are still waiting in the UARTE.
+        let received = (self.counter + 2 * len - start) % (2 * len);
+        let in_ram = (self.dma_end + 2 * len - start) % (2 * len);
+        (start + received.min(in_ram)) % (2 * len)
     }
 }
 
@@ -102,14 +253,6 @@ impl<U: UarteInstance> interrupt::typelevel::Handler<U::Interrupt> for Interrupt
                 ss.rx_waker.wake();
             }
 
-            if r.events_endrx().read() != 0 {
-                //trace!("  irq_rx: endrx");
-                r.events_endrx().write_value(0);
-
-                let val = s.rx_ended_count.load(Ordering::Relaxed);
-                s.rx_ended_count.store(val.wrapping_add(1), Ordering::Relaxed);
-            }
-
             if r.events_rxstarted().read() != 0 || !s.rx_started.load(Ordering::Relaxed) {
                 //trace!("  irq_rx: rxstarted");
                 let (ptr, len) = rx.push_buf();
@@ -122,55 +265,48 @@ impl<U: UarteInstance> interrupt::typelevel::Handler<U::Interrupt> for Interrupt
                     r.rxd().ptr().write_value(ptr as u32);
                     r.rxd().maxcnt().write(|w| w.set_maxcnt(chunk_len as _));
 
-                    let chn = s.rx_ppi_ch.load(Ordering::Relaxed);
-
-                    // Enable endrx -> startrx PPI channel.
-                    // From this point on, if endrx happens, startrx is automatically fired.
-                    ppi::regs().chenset().write(|w| w.0 = 1 << chn);
-
-                    // It is possible that endrx happened BEFORE enabling the PPI. In this case
-                    // the PPI channel doesn't trigger, and we'd hang. We have to detect this
-                    // and manually start.
-
-                    // check again in case endrx has happened between the last check and now.
-                    if r.events_endrx().read() != 0 {
-                        //trace!("  irq_rx: endrx");
-                        r.events_endrx().write_value(0);
-
-                        let val = s.rx_ended_count.load(Ordering::Relaxed);
-                        s.rx_ended_count.store(val.wrapping_add(1), Ordering::Relaxed);
-                    }
-
-                    let rx_ended = s.rx_ended_count.load(Ordering::Relaxed);
-                    let rx_started = s.rx_started_count.load(Ordering::Relaxed);
-
-                    // If we started the same amount of transfers as ended, the last rxend has
-                    // already occured.
-                    let rxend_happened = rx_started == rx_ended;
-
-                    // Check if the PPI channel is still enabled. The PPI channel disables itself
-                    // when it fires, so if it's still enabled it hasn't fired.
-                    let ppi_ch_enabled = ppi::regs().chen().read().ch(chn as _);
-
-                    // if rxend happened, and the ppi channel hasn't fired yet, the rxend got missed.
-                    // this condition also naturally matches if `!started`, needed to kickstart the DMA.
-                    if rxend_happened && ppi_ch_enabled {
-                        //trace!("manually starting.");
-
-                        // disable the ppi ch, it's of no use anymore.
-                        ppi::regs().chenclr().write(|w| w.set_ch(chn as _, true));
-
-                        // manually start
+                    if s.rx_started.load(Ordering::Relaxed) {
+                        // Queue the transfer: the PPI channel starts it when the running one ends
+                        // (ENDRX), and then disables itself. If that ENDRX has already happened,
+                        // the PPI channel never fires; the check below catches that.
+                        let chn = s.rx_ppi_ch.load(Ordering::Relaxed);
+                        ppi::regs().chenset().write(|w| w.0 = 1 << chn);
+                    } else {
                         r.tasks_startrx().write_value(1);
+                        s.rx_started.store(true, Ordering::Relaxed);
                     }
 
                     rx.push_done(chunk_len);
-
-                    s.rx_started_count.store(rx_started.wrapping_add(1), Ordering::Relaxed);
-                    s.rx_started.store(true, Ordering::Relaxed);
                 } else {
                     //trace!("  irq_rx: rxstarted no buf");
                     r.intenclr().write(|w| w.set_rxstarted(true));
+                }
+            }
+
+            // If a transfer is queued but the PPI channel missed the ENDRX it waits for, the DMA
+            // has stopped. Read its state from the hardware every time rather than counting ENDRX
+            // events: ENDRX is a flag, so two transfers ending while this interrupt is held off
+            // look like one.
+            let pos = RxDmaPos::read(s);
+            if pos.queued {
+                match pos.counter_past_dma_end(s.rx_buf.len()) {
+                    Some(0) => {
+                        // All bytes of the running transfer are counted, nothing more. Either it is
+                        // still finishing and the PPI channel will start the queued transfer, or
+                        // it ended before the channel was armed. Nothing is waiting either way, so
+                        // decide when the next byte arrives.
+                        r.intenset().write(|w| w.set_rxdrdy(true));
+                    }
+                    Some(_) => {
+                        // A byte past the end of the running transfer has been received, so the
+                        // running transfer ended at least one frame ago: the PPI channel missed
+                        // its ENDRX and can't fire any more. Start the queued transfer by hand.
+                        let chn = s.rx_ppi_ch.load(Ordering::Relaxed);
+                        ppi::regs().chenclr().write(|w| w.set_ch(chn as _, true));
+                        r.tasks_startrx().write_value(1);
+                        ss.rx_waker.wake();
+                    }
+                    None => {}
                 }
             }
         }
@@ -678,16 +814,12 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
 
         // Initialize state
         let s = U::buffered_state();
-        s.rx_started_count.store(0, Ordering::Relaxed);
-        s.rx_ended_count.store(0, Ordering::Relaxed);
         s.rx_started.store(false, Ordering::Relaxed);
         s.rx_overrun.store(false, Ordering::Relaxed);
-        // The DMA receives into a ring of equal chunks: one being received, one queued in the
-        // double-buffered PTR/MAXCNT registers and the rest holding data for the reader.  The ring
-        // must be a whole number of chunks so that every chunk is contiguous, or the IRQ would
-        // never find room for one at the end of the ring and reception would stop.
-        let chunk_len = (rx_buffer.len() / 2).min(EASY_DMA_SIZE);
-        let rx_len = rx_buffer.len() - rx_buffer.len() % chunk_len;
+        let RxLayout {
+            chunk_len,
+            ring_len: rx_len,
+        } = RxLayout::new(rx_buffer.len(), EASY_DMA_SIZE);
         s.rx_chunk_len.store(chunk_len, Ordering::Relaxed);
         unsafe { s.rx_buf.init(rx_buffer.as_mut_ptr(), rx_len) };
 
@@ -697,18 +829,17 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
 
         r.events_rxstarted().write_value(0);
         r.events_error().write_value(0);
-        r.events_endrx().write_value(0);
 
         // Enable interrupts
         r.intenset().write(|w| {
             w.set_endtx(true);
             w.set_rxstarted(true);
             w.set_error(true);
-            w.set_endrx(true);
         });
 
         // Configure byte counter.
         let timer = Timer::new_counter(timer);
+        s.rx_timer.store(T::regs().as_ptr(), Ordering::Relaxed);
         timer.cc(1).write(rx_len as u32 * 2);
         timer.cc(1).short_compare_clear();
         timer.clear();
@@ -760,42 +891,14 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
                 return Poll::Ready(Err(Error::Overrun));
             }
 
-            // Read the RXDRDY counter.
-            T::regs().tasks_capture(0).write_value(1);
-            let mut end = T::regs().cc(0).read() as usize;
-            //trace!("  rxdrdy count = {:?}", end);
-
-            // We've set a compare channel that resets the counter to 0 when it reaches `len*2`.
-            // However, it's unclear if that's instant, or there's a small window where you can
-            // still read `len()*2`.
-            // This could happen if in one clock cycle the counter is updated, and in the next the
-            // clear takes effect. The docs are very sparse, they just say "Task delays: After TIMER
-            // is started, the CLEAR, COUNT, and STOP tasks are guaranteed to take effect within one
-            // clock cycle of the PCLK16M." :shrug:
-            // So, we wrap the counter ourselves, just in case.
-            if end > s.rx_buf.len() * 2 {
-                end = 0
-            }
-
-            // This logic mirrors `atomic_ring_buffer::Reader::pop_buf()`
-            let mut start = s.rx_buf.start.load(Ordering::Relaxed);
-            let len = s.rx_buf.len();
-            if start == end {
+            let start = s.rx_buf.start.load(Ordering::Relaxed);
+            let end = Self::rx_end(start);
+            let Some((start, n)) = rx_readable(start, end, s.rx_buf.len()) else {
                 //trace!("  empty");
                 ss.rx_waker.register(cx.waker());
                 r.intenset().write(|w| w.set_rxdrdy(true));
                 return Poll::Pending;
-            }
-
-            if start >= len {
-                start -= len
-            }
-            if end >= len {
-                end -= len
-            }
-
-            let n = if end > start { end - start } else { len - start };
-            assert!(n != 0);
+            };
             //trace!("  uarte ringbuf: pop_buf {:?}..{:?}", start, start + n);
 
             let buf = s.rx_buf.buf.load(Ordering::Relaxed);
@@ -815,13 +918,21 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
         U::regs().intenset().write(|w| w.set_rxstarted(true));
     }
 
+    /// The ring index up to which received bytes are in RAM, for a reader at `start`.
+    fn rx_end(start: usize) -> usize {
+        let s = U::buffered_state();
+        let pos = critical_section::with(|_| RxDmaPos::read(s));
+        pos.rx_end(start, s.rx_buf.len())
+    }
+
     /// we are ready to read if there is data in the buffer
     fn read_ready() -> Result<bool, Error> {
         let state = U::buffered_state();
         if state.rx_overrun.swap(false, Ordering::Acquire) {
             return Err(Error::Overrun);
         }
-        Ok(!state.rx_buf.is_empty())
+        let start = state.rx_buf.start.load(Ordering::Relaxed);
+        Ok(start != Self::rx_end(start))
     }
 }
 
